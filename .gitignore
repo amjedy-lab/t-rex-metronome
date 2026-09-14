@@ -1,0 +1,8 @@
+# Личное и генерируемое — в публичный репозиторий не входит
+tm_settings.txt
+tm_trainings.jsonl
+tm_*.wav
+t_rex_metr.exe
+backup_*/
+trex_metr.md
+icon_preview.png
