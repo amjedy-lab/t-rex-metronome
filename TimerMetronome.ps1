@@ -1,5 +1,9 @@
-﻿# T-REX метроном v1.17 — прозрачный виджет "таймер + метроном" (WPF)
+﻿# T-REX метроном v1.18 — прозрачный виджет "таймер + метроном" (WPF)
 # Управление: перетаскивание — за панель; прозрачность — колёсико или панель под шестерёнкой; закрытие — X или правый клик.
+# v1.18: ровный темп метронома: тики планируются по абсолютной сетке от старта (задержка диспетчера
+#        компенсируется коротким следующим интервалом, темп не ползёт), тики получили приоритет Send,
+#        на время работы метронома системный таймер переведён в режим 1 мс (timeBeginPeriod),
+#        звуки предзагружены (Load) — первый щелчок не ждёт чтения wav.
 # v1.17: поле дробления в логе тренировки переименовано в Duration — это длительность НОТЫ (4=четверть,
 #        8=восьмая, 16=шестнадцатая, 3=триоль), та же нотация, что у -div; поле Div убрано.
 # v1.16: дробление доли — четверти/восьмые/шестнадцатые/триоли (кнопка-циклер с глифами, -div 4|8|16|3);
@@ -123,6 +127,15 @@ $playerTick   = New-Object System.Media.SoundPlayer($wavTick)
 $playerTickHi = New-Object System.Media.SoundPlayer($wavTickHi)
 $playerTickSub = New-Object System.Media.SoundPlayer($wavTickSub)
 $playerAlarm  = New-Object System.Media.SoundPlayer($wavAlarm)
+# предзагрузка: Play() больше не тратит время на чтение wav перед первым щелчком
+foreach ($p in @($playerTick, $playerTickHi, $playerTickSub, $playerAlarm)) { try { $p.Load() } catch { } }
+
+# --- точность метронома: повышаем разрешение системного таймера до 1 мс на время работы щелчков ---
+# (штатный тик Windows ~15.6 мс квантует короткие интервалы; границы подъёма/сброса — Start-Metro/Add_Closed)
+Add-Type -Namespace WinMM -Name Native -MemberDefinition @'
+[DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
+[DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint ms);
+'@
 
 # --- интерфейс ---
 [void][System.Windows.Forms.Application]::EnableVisualStyles()
@@ -228,7 +241,7 @@ $xamlText = @'
                 Width="24" Height="18" Foreground="#FF8888AA" BorderThickness="0" Background="Transparent" Cursor="Hand"
                 Margin="0,0,6,0"/>
         <Button x:Name="BtnLink" DockPanel.Dock="Right" Content="Связать" Style="{StaticResource NeutralBtn}" Margin="0,0,10,0"/>
-        <TextBlock x:Name="TitleText" Text="T-REX метроном v1.17" FontFamily="Segoe UI" FontSize="13" FontWeight="Bold"
+        <TextBlock x:Name="TitleText" Text="T-REX метроном v1.18" FontFamily="Segoe UI" FontSize="13" FontWeight="Bold"
                    Foreground="#FF7FB4FF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
       </DockPanel>
 
@@ -349,6 +362,8 @@ $state = @{
     Div         = 1     # щелчков на долю: 1=четверти, 2=восьмые, 4=шестнадцатые, 3=триоли (нотация 4|8|16|3 — только в CLI/файлах)
     Accents     = @(1)     # сильные доли (номера с 1); дефолт — только первая
     ClickCount  = 0        # щелчков прозвучало в такте (0..Beats*Div-1); доля = floor(i/Div)+1
+    MetroSw     = $null    # Stopwatch сетки щелчков (антидрейф): узлы = k*интервал от момента старта
+    TimerResRaised = $false # timeBeginPeriod(1) поднят (сброс — в Add_Closed)
     Linked      = $false   # режим "Связать": общий старт, метроном стоп при нуле таймера
     Overrun     = $false   # перехлёст: таймер на нуле, такт доигрывается до конца (время уходит в минус)
     ExitOnFinish= $false   # закрыть виджет, когда таймер дойдёт до нуля
@@ -606,8 +621,13 @@ function Update-TimerDisplay {
 function Start-Metro {
     if (-not $state.MetroRun) {
         $state.ClickCount = 0
+        $state.MetroSw = [System.Diagnostics.Stopwatch]::StartNew()   # сетка щелчков отсчитывается от этого момента
         $metroTimer.Interval = Get-MetroInterval
         $metroTimer.Start(); $state.MetroRun = $true
+        if (-not $state.TimerResRaised) {
+            # 1 мс вместо штатных ~15.6: DispatcherTimer опирается на системный тик
+            try { $state.TimerResRaised = $true; [void][WinMM.Native]::timeBeginPeriod(1) } catch { }
+        }
         $btnMetroStart.Content = 'Стоп'
     }
 }
@@ -650,7 +670,8 @@ $dispatchTimer.Add_Tick({
 })
 
 # --- метроном ---
-$metroTimer = New-Object System.Windows.Threading.DispatcherTimer
+# приоритет Send: тик метронома исполняется до ввода и рендера, а не ждёт их в очереди диспетчера
+$metroTimer = New-Object System.Windows.Threading.DispatcherTimer([System.Windows.Threading.DispatcherPriority]::Send)
 $metroTimer.Add_Tick({
     # счётчик щелчков такта: 0..Beats*Div-1; доля = floor(i/Div)+1, i кратно Div = щелчок ДОЛИ
     $i = $state.ClickCount
@@ -671,6 +692,15 @@ $metroTimer.Add_Tick({
         $playerAlarm.Play()   # сигнал — после последней прозвучавшей доли, а не в момент нуля
         if ($state.ExitOnFinish) { $state.Completed = $true; $closeTimer.Start() }
         Write-TrainingLog   # такт после нуля доигран: событие логируется здесь
+    }
+    if ($state.MetroRun) {
+        # антидрейф: интервал до БЛИЖАЙШЕГО БУДУЩЕГО узла сетки от старта, а не «номинал от сейчас» —
+        # разовая задержка диспетчера компенсируется более коротким интервалом, и темп не ползёт
+        # (скобки обязательны: Get-MetroInterval.TotalMilliseconds = вызов несуществующей команды)
+        $nominalMs = (Get-MetroInterval).TotalMilliseconds
+        $nextMs = $nominalMs - ($state.MetroSw.ElapsedMilliseconds % $nominalMs)
+        if ($nextMs -lt 1) { $nextMs = 1 }
+        $metroTimer.Interval = [TimeSpan]::FromMilliseconds($nextMs)
     }
 })
 
@@ -721,6 +751,7 @@ $clickBpm = {
     $state.Bpm = [Math]::Min(300, [Math]::Max(30, $state.Bpm + $delta))
     $bpmDisplay.Text = "$($state.Bpm) BPM"
     $metroTimer.Interval = Get-MetroInterval
+    if ($state.MetroRun) { $state.MetroSw.Restart() }   # новый темп = новая сетка от сейчас
 }
 foreach ($n in 'BtnBpmM10','BtnBpmM1','BtnBpmP1','BtnBpmP10') {
     (& $Find $n).Add_Click($clickBpm)
@@ -742,6 +773,7 @@ $btnDiv.Add_Click({
     $state.Div = switch ($state.Div) { 1 { 2 } 2 { 4 } 4 { 3 } default { 1 } }
     $state.ClickCount = 0
     $metroTimer.Interval = Get-MetroInterval
+    if ($state.MetroRun) { $state.MetroSw.Restart() }   # новая плотность щелчков = новая сетка от сейчас
     Update-DivBtn
 })
 
@@ -838,7 +870,7 @@ $btnAbout.Add_Click({
     $sp = New-Object System.Windows.Controls.StackPanel
     $sp.Margin = New-Object System.Windows.Thickness(16)
     $tb1 = New-Object System.Windows.Controls.TextBlock
-    $tb1.Text = 'T-REX метроном v1.17'
+    $tb1.Text = 'T-REX метроном v1.18'
     $tb1.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI')
     $tb1.FontSize = 16; $tb1.FontWeight = [System.Windows.FontWeights]::Bold
     $tb1.Foreground = $bc.ConvertFromString('#FF7FB4FF')
@@ -893,6 +925,8 @@ $win.Add_Closed({
     # отпустить mutex сразу: ps2exe-процесс ещё живёт секунды после закрытия окна,
     # и мгновенный перезапуск за это время не должен отсекаться как "второй экземпляр"
     try { $singleton.ReleaseMutex() } catch { }
+    # вернуть системному таймеру штатное разрешение (парно к timeBeginPeriod в Start-Metro)
+    if ($state.TimerResRaised) { try { $state.TimerResRaised = $false; [void][WinMM.Native]::timeEndPeriod(1) } catch { } }
 })
 
 Update-TimerDisplay
