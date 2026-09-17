@@ -1,5 +1,9 @@
-﻿# T-REX метроном v1.18 — прозрачный виджет "таймер + метроном" (WPF)
+﻿# T-REX метроном v1.19 — прозрачный виджет "таймер + метроном" (WPF)
 # Управление: перетаскивание — за панель; прозрачность — колёсико или панель под шестерёнкой; закрытие — X или правый клик.
+# v1.19: новый аудиодвижок щелчков (NAudio, опционально): клики заранее закладываются в непрерывную аудиоленту
+#        (BufferedWaveProvider + WasapiOut) с упреждением ~350 мс и звучат по часам аудиоустройства — дрожание
+#        диспетчера WPF перестаёт быть слышным. NAudio.Core.dll + NAudio.Wasapi.dll (MIT) кладутся рядом со
+#        скриптом/exe; если их нет или устройство не открылось — прежний путь v1.18 (SoundPlayer по тикам).
 # v1.18: ровный темп метронома: тики планируются по абсолютной сетке от старта (задержка диспетчера
 #        компенсируется коротким следующим интервалом, темп не ползёт), тики получили приоритет Send,
 #        на время работы метронома системный таймер переведён в режим 1 мс (timeBeginPeriod),
@@ -130,6 +134,120 @@ $playerAlarm  = New-Object System.Media.SoundPlayer($wavAlarm)
 # предзагрузка: Play() больше не тратит время на чтение wav перед первым щелчком
 foreach ($p in @($playerTick, $playerTickHi, $playerTickSub, $playerAlarm)) { try { $p.Load() } catch { } }
 
+# --- движок точного щёлканья (v1.19, опциональный): клики заранее пишутся в непрерывную аудиоленту
+# (BufferedWaveProvider -> WasapiOut) с упреждением и звучат по часам аудиоустройства, а не по таймеру.
+# NAudio.Core.dll + NAudio.Wasapi.dll (MIT, netstandard2.0) лежат рядом со скриптом/exe;
+# нет библиотек / не открылось устройство — работаем прежним путём SoundPlayer (v1.18). ---
+$audio = $null
+try {
+    $dllCore = Join-Path $scriptDir 'NAudio.Core.dll'
+    $dllWas  = Join-Path $scriptDir 'NAudio.Wasapi.dll'
+    if ((Test-Path -LiteralPath $dllCore) -and (Test-Path -LiteralPath $dllWas)) {
+        $null = [Reflection.Assembly]::LoadFrom($dllCore)
+        $null = [Reflection.Assembly]::LoadFrom($dllWas)
+        $audio = @{ Ready = $true }
+    }
+} catch { $audio = $null }
+
+# сэмплы щелчка для ленты: из wav-файла (канонический PCM 16 бит/моно/44100) или синус в памяти (дефолт Make-Wav)
+function Get-ClickSamples([string]$wavPath, [double]$freq, [double]$dur, [double]$decay, [double]$amp) {
+    try {
+        $b = [IO.File]::ReadAllBytes($wavPath)
+        if ($b.Length -gt 44 -and $b[0] -eq 0x52 -and $b[1] -eq 0x49) {   # "RI" из "RIFF"
+            $fmtOk = $false; $dataOff = -1; $dataLen = 0; $pos = 12
+            while ($pos + 8 -le $b.Length) {
+                $id = [Text.Encoding]::ASCII.GetString($b, $pos, 4)
+                $len = [BitConverter]::ToInt32($b, $pos + 4)
+                if ($id -eq 'fmt ') {
+                    $ch   = [BitConverter]::ToInt16($b, $pos + 10)   # каналы (смещение 2 внутри fmt)
+                    $rate = [BitConverter]::ToInt32($b, $pos + 12)   # частота (смещение 4)
+                    $bits = [BitConverter]::ToInt16($b, $pos + 22)   # биты (смещение 14)
+                    $fmtOk = ($ch -eq 1 -and $rate -eq 44100 -and $bits -eq 16)
+                } elseif ($id -eq 'data') { $dataOff = $pos + 8; $dataLen = [Math]::Min($len, $b.Length - $dataOff) }
+                if ($len -le 0) { break }
+                $pos += 8 + $len + ($len % 2)
+            }
+            if ($fmtOk -and $dataOff -gt 0 -and $dataLen -gt 0) {
+                $s = New-Object 'byte[]' $dataLen
+                [Array]::Copy($b, $dataOff, $s, 0, $dataLen)
+                return $s
+            }
+        }
+    } catch { }
+    $rate = 44100; $n = [int]($rate * $dur)
+    $s = New-Object 'byte[]' ($n * 2)
+    for ($i = 0; $i -lt $n; $i++) {
+        $env = [Math]::Exp(-$decay * $i / $n)
+        $v = [int16]([Math]::Sin(2 * [Math]::PI * $freq * $i / $rate) * $env * $amp * 32767)
+        $bb = [BitConverter]::GetBytes($v); $s[$i*2] = $bb[0]; $s[$i*2+1] = $bb[1]
+    }
+    return $s
+}
+# моно-сэмплы -> стерео-массив ленты (левый и правый канал дублируются)
+function Convert-ToStereo([byte[]]$mono) {
+    $st = New-Object 'byte[]' ($mono.Length * 2)
+    $half = [Math]::Floor($mono.Length / 2)
+    for ($i = 0; $i -lt $half; $i++) {
+        $st[$i*4] = $mono[$i*2]; $st[$i*4+1] = $mono[$i*2+1]
+        $st[$i*4+2] = $mono[$i*2]; $st[$i*4+3] = $mono[$i*2+1]
+    }
+    return $st
+}
+if ($audio) {
+    $audio.Clicks = @{
+        Tick = Convert-ToStereo (Get-ClickSamples $wavTick 900 0.05 6 0.75)
+        Hi   = Convert-ToStereo (Get-ClickSamples $wavTickHi 1400 0.05 6 0.75)
+        Sub  = Convert-ToStereo (Get-ClickSamples $wavTickSub 650 0.03 9 0.4)
+    }
+}
+
+# --- сама лента: стерео 16 бит 44100; Written — сколько мс записано, Played — сколько мс прочитано выводом ---
+$audioBytesPerMs  = 176.4          # 44100 Гц * 2 канала * 2 байта / 1000
+$audioLookaheadMs = 350            # насколько вперёд планировщик пишет ленту (покрывает дрожание диспетчера)
+$audioLaunchMs    = 150            # пауза до первого щелчка после старта (лента должна заполниться)
+$audioSilence     = New-Object 'byte[]' 17640    # кэш 100 мс тишины
+function Start-AudioEngine {
+    if (-not $audio.Ready) { return $false }
+    try {
+        $wf = New-Object NAudio.Wave.WaveFormat(44100, 16, 2)
+        $buf = New-Object NAudio.Wave.BufferedWaveProvider($wf)
+        $buf.BufferDuration = [TimeSpan]::FromSeconds(2)
+        $buf.ReadFully = $true
+        $out = New-Object NAudio.Wave.WasapiOut([NAudio.CoreAudioApi.AudioClientShareMode]::Shared, 60)
+        $out.Init($buf)
+        $out.Play()
+        $audio.Out = $out; $audio.Buf = $buf; $audio.Written = 0.0
+        Write-AudioSilenceMs $audioLaunchMs
+        return $true
+    } catch { $audio.Ready = $false; $audio.Out = $null; $audio.Buf = $null; return $false }
+}
+function Stop-AudioEngine {
+    if ($audio.Out) { try { $audio.Out.Stop(); $audio.Out.Dispose() } catch { } }
+    $audio.Out = $null; $audio.Buf = $null
+}
+function Write-AudioSilenceMs([double]$ms) {
+    $n = [int]($ms * $audioBytesPerMs)
+    while ($n -gt 0) {
+        $c = [Math]::Min($n, $audioSilence.Length)
+        $audio.Buf.AddSamples($audioSilence, 0, $c)
+        $audio.Written += $c / $audioBytesPerMs
+        $n -= $c
+    }
+}
+function Write-AudioUntilMs([double]$targetMs) {
+    if ($audio.Written -lt $targetMs) { Write-AudioSilenceMs ($targetMs - $audio.Written) }
+}
+function Write-AudioClick([byte[]]$stereo) {
+    $audio.Buf.AddSamples($stereo, 0, $stereo.Length)
+    $audio.Written += $stereo.Length / $audioBytesPerMs
+}
+function Get-AudioPlayedMs { ($audio.Written - $audio.Buf.BufferedBytes / $audioBytesPerMs) }
+# смена сетки на лету (BPM/дробление): следующий щелчок — от текущего конца ленты,
+# уже записанное прозвучит по-старому (рывка нет), счётчик такта сохраняется
+function Reset-AudioGrid {
+    $state.NextClickMs = [Math]::Max($audio.Written, (Get-AudioPlayedMs) + $audioLaunchMs)
+}
+
 # --- точность метронома: повышаем разрешение системного таймера до 1 мс на время работы щелчков ---
 # (штатный тик Windows ~15.6 мс квантует короткие интервалы; границы подъёма/сброса — Start-Metro/Add_Closed)
 Add-Type -Namespace WinMM -Name Native -MemberDefinition @'
@@ -241,7 +359,7 @@ $xamlText = @'
                 Width="24" Height="18" Foreground="#FF8888AA" BorderThickness="0" Background="Transparent" Cursor="Hand"
                 Margin="0,0,6,0"/>
         <Button x:Name="BtnLink" DockPanel.Dock="Right" Content="Связать" Style="{StaticResource NeutralBtn}" Margin="0,0,10,0"/>
-        <TextBlock x:Name="TitleText" Text="T-REX метроном v1.18" FontFamily="Segoe UI" FontSize="13" FontWeight="Bold"
+        <TextBlock x:Name="TitleText" Text="T-REX метроном v1.19" FontFamily="Segoe UI" FontSize="13" FontWeight="Bold"
                    Foreground="#FF7FB4FF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
       </DockPanel>
 
@@ -362,7 +480,11 @@ $state = @{
     Div         = 1     # щелчков на долю: 1=четверти, 2=восьмые, 4=шестнадцатые, 3=триоли (нотация 4|8|16|3 — только в CLI/файлах)
     Accents     = @(1)     # сильные доли (номера с 1); дефолт — только первая
     ClickCount  = 0        # щелчков прозвучало в такте (0..Beats*Div-1); доля = floor(i/Div)+1
-    MetroSw     = $null    # Stopwatch сетки щелчков (антидрейф): узлы = k*интервал от момента старта
+    MetroSw     = $null    # Stopwatch сетки щелчков (антидрейф): узлы = k*интервал от момента старта (fallback-путь)
+    UseAudio    = $false   # щелчки идут через аудиоленту NAudio (движок запущен); $false — прежний путь по тикам
+    NextClickMs = 0.0      # лента: позиция следующего щелчка (мс от старта движка)
+    FinaleAtMs  = $null    # лента: запланированная граница доигрываемого такта (Overrun-финиш)
+    Highlights  = @()      # очередь подсветки долей: @{Ms;Beat;Sub} — гасится, когда позиция ленты прозвучала
     TimerResRaised = $false # timeBeginPeriod(1) поднят (сброс — в Add_Closed)
     Linked      = $false   # режим "Связать": общий старт, метроном стоп при нуле таймера
     Overrun     = $false   # перехлёст: таймер на нуле, такт доигрывается до конца (время уходит в минус)
@@ -621,11 +743,25 @@ function Update-TimerDisplay {
 function Start-Metro {
     if (-not $state.MetroRun) {
         $state.ClickCount = 0
-        $state.MetroSw = [System.Diagnostics.Stopwatch]::StartNew()   # сетка щелчков отсчитывается от этого момента
-        $metroTimer.Interval = Get-MetroInterval
+        $state.Highlights = @()
+        $state.FinaleAtMs = $null
+        # основной путь: аудиолента NAudio (если библиотеки на месте и устройство открылось);
+        # планировщик тикает грубо (50 мс) — точность обеспечивает не он, а часы аудиоустройства
+        $engineStarted = $false
+        if ($audio -and $audio.Ready) {
+            $engineStarted = Start-AudioEngine
+            if ($engineStarted) { $state.NextClickMs = $audioLaunchMs + 0.0 }
+        }
+        $state.UseAudio = $engineStarted
+        if ($engineStarted) {
+            $metroTimer.Interval = [TimeSpan]::FromMilliseconds(50)
+        } else {
+            $state.MetroSw = [System.Diagnostics.Stopwatch]::StartNew()   # сетка щелчков отсчитывается от этого момента
+            $metroTimer.Interval = Get-MetroInterval
+        }
         $metroTimer.Start(); $state.MetroRun = $true
         if (-not $state.TimerResRaised) {
-            # 1 мс вместо штатных ~15.6: DispatcherTimer опирается на системный тик
+            # 1 мс вместо штатных ~15.6: тикам планировщика (и подсветке) меньше приходится ждать системный тик
             try { $state.TimerResRaised = $true; [void][WinMM.Native]::timeBeginPeriod(1) } catch { }
         }
         $btnMetroStart.Content = 'Стоп'
@@ -634,6 +770,7 @@ function Start-Metro {
 function Stop-Metro {
     if ($state.MetroRun) {
         $metroTimer.Stop(); $state.MetroRun = $false
+        if ($state.UseAudio) { $state.UseAudio = $false; Stop-AudioEngine }
         $btnMetroStart.Content = 'Старт'
         Update-BeatHighlight 0
     }
@@ -673,34 +810,85 @@ $dispatchTimer.Add_Tick({
 # приоритет Send: тик метронома исполняется до ввода и рендера, а не ждёт их в очереди диспетчера
 $metroTimer = New-Object System.Windows.Threading.DispatcherTimer([System.Windows.Threading.DispatcherPriority]::Send)
 $metroTimer.Add_Tick({
-    # счётчик щелчков такта: 0..Beats*Div-1; доля = floor(i/Div)+1, i кратно Div = щелчок ДОЛИ
-    $i = $state.ClickCount
-    $beat = [math]::Floor($i / $state.Div) + 1
-    $isBeatClick = ($i % $state.Div) -eq 0
-    if (-not $isBeatClick) { $playerTickSub.Play() }
-    elseif ($state.Accents -contains $beat) { $playerTickHi.Play() }
-    else { $playerTick.Play() }
-    Update-BeatHighlight $beat (-not $isBeatClick)
-    $state.ClickCount = ($i + 1) % ($state.Beats * $state.Div)
-    if ($state.Overrun -and $state.ClickCount -eq 0) {
-        # такт после нуля таймера доигран до конца: остановить всё на границе такта
-        $state.Overrun = $false
-        $dispatchTimer.Stop()
-        $state.TimerRun = $false
-        $btnTimerStart.Content = 'Старт'
-        Stop-Metro
-        $playerAlarm.Play()   # сигнал — после последней прозвучавшей доли, а не в момент нуля
-        if ($state.ExitOnFinish) { $state.Completed = $true; $closeTimer.Start() }
-        Write-TrainingLog   # такт после нуля доигран: событие логируется здесь
-    }
-    if ($state.MetroRun) {
-        # антидрейф: интервал до БЛИЖАЙШЕГО БУДУЩЕГО узла сетки от старта, а не «номинал от сейчас» —
-        # разовая задержка диспетчера компенсируется более коротким интервалом, и темп не ползёт
-        # (скобки обязательны: Get-MetroInterval.TotalMilliseconds = вызов несуществующей команды)
-        $nominalMs = (Get-MetroInterval).TotalMilliseconds
-        $nextMs = $nominalMs - ($state.MetroSw.ElapsedMilliseconds % $nominalMs)
-        if ($nextMs -lt 1) { $nextMs = 1 }
-        $metroTimer.Interval = [TimeSpan]::FromMilliseconds($nextMs)
+    if ($state.UseAudio) {
+        # ===== основной путь: аудиолента. Тик — грубый планировщик: докладывает в буфер ленту
+        # (тишину и щелчки) с упреждением; звучание идёт по часам аудиоустройства, дрожание
+        # диспетчера на слух отсутствует, пока оно меньше упреждения =====
+        $playedMs = Get-AudioPlayedMs
+        $horizonMs = $playedMs + $audioLookaheadMs
+        $intervalMs = (Get-MetroInterval).TotalMilliseconds
+        # счётчик щелчков такта: 0..Beats*Div-1; доля = floor(i/Div)+1, i кратно Div = щелчок ДОЛИ;
+        # после запланированного финала (FinaleAtMs) новых щелчков не закладываем
+        while ($null -eq $state.FinaleAtMs -and $state.NextClickMs -le $horizonMs) {
+            Write-AudioUntilMs $state.NextClickMs
+            $i = $state.ClickCount
+            $beat = [math]::Floor($i / $state.Div) + 1
+            $isBeatClick = ($i % $state.Div) -eq 0
+            if (-not $isBeatClick) { Write-AudioClick $audio.Clicks.Sub }
+            elseif ($state.Accents -contains $beat) { Write-AudioClick $audio.Clicks.Hi }
+            else { Write-AudioClick $audio.Clicks.Tick }
+            $state.Highlights += @{ Ms = $state.NextClickMs; Beat = $beat; Sub = (-not $isBeatClick) }
+            $state.ClickCount = ($i + 1) % ($state.Beats * $state.Div)
+            $state.NextClickMs += $intervalMs
+            if ($state.Overrun -and $state.ClickCount -eq 0) {
+                # такт после нуля таймера запланирован до конца: стоп, когда лента дойдёт до границы такта
+                $state.FinaleAtMs = $state.NextClickMs
+                break
+            }
+        }
+        if ($null -eq $state.FinaleAtMs) { Write-AudioUntilMs $horizonMs }
+        elseif ($audio.Written -lt $state.FinaleAtMs) {
+            # финал запланирован: ленту нужно дописать тишиной ДО границы такта, иначе буфер
+            # высохнет, позиция «прочитано» замрёт раньше границы и финал никогда не наступит
+            Write-AudioUntilMs $state.FinaleAtMs
+        }
+        # подсветка: применяем последний щелчок, чья позиция уже прозвучала (по часам ленты)
+        $lastH = $null
+        $rest = @()
+        foreach ($h in $state.Highlights) { if ($h.Ms -le $playedMs) { $lastH = $h } else { $rest += $h } }
+        if ($lastH) { $state.Highlights = $rest; Update-BeatHighlight $lastH.Beat $lastH.Sub }
+        # финиш доигранного такта — в момент границы такта по часам ленты (последний щелчок уже в буфере устройства)
+        if ($null -ne $state.FinaleAtMs -and $playedMs -ge $state.FinaleAtMs) {
+            $state.FinaleAtMs = $null
+            $state.Overrun = $false
+            $dispatchTimer.Stop()
+            $state.TimerRun = $false
+            $btnTimerStart.Content = 'Старт'
+            Stop-Metro
+            $playerAlarm.Play()   # сигнал — после последней прозвучавшей доли, а не в момент нуля
+            if ($state.ExitOnFinish) { $state.Completed = $true; $closeTimer.Start() }
+            Write-TrainingLog   # такт после нуля доигран: событие логируется здесь
+        }
+    } else {
+        # ===== fallback-путь (нет NAudio или устройства): щелчок играется самим тиком =====
+        $i = $state.ClickCount
+        $beat = [math]::Floor($i / $state.Div) + 1
+        $isBeatClick = ($i % $state.Div) -eq 0
+        if (-not $isBeatClick) { $playerTickSub.Play() }
+        elseif ($state.Accents -contains $beat) { $playerTickHi.Play() }
+        else { $playerTick.Play() }
+        Update-BeatHighlight $beat (-not $isBeatClick)
+        $state.ClickCount = ($i + 1) % ($state.Beats * $state.Div)
+        if ($state.Overrun -and $state.ClickCount -eq 0) {
+            # такт после нуля таймера доигран до конца: остановить всё на границе такта
+            $state.Overrun = $false
+            $dispatchTimer.Stop()
+            $state.TimerRun = $false
+            $btnTimerStart.Content = 'Старт'
+            Stop-Metro
+            $playerAlarm.Play()   # сигнал — после последней прозвучавшей доли, а не в момент нуля
+            if ($state.ExitOnFinish) { $state.Completed = $true; $closeTimer.Start() }
+            Write-TrainingLog   # такт после нуля доигран: событие логируется здесь
+        }
+        if ($state.MetroRun) {
+            # антидрейф: интервал до БЛИЖАЙШЕГО БУДУЩЕГО узла сетки от старта, а не «номинал от сейчас» —
+            # разовая задержка диспетчера компенсируется более коротким интервалом, и темп не ползёт
+            # (скобки обязательны: Get-MetroInterval.TotalMilliseconds = вызов несуществующей команды)
+            $nominalMs = (Get-MetroInterval).TotalMilliseconds
+            $nextMs = $nominalMs - ($state.MetroSw.ElapsedMilliseconds % $nominalMs)
+            if ($nextMs -lt 1) { $nextMs = 1 }
+            $metroTimer.Interval = [TimeSpan]::FromMilliseconds($nextMs)
+        }
     }
 })
 
@@ -750,8 +938,9 @@ $clickBpm = {
     $delta = [int]$sender.Content
     $state.Bpm = [Math]::Min(300, [Math]::Max(30, $state.Bpm + $delta))
     $bpmDisplay.Text = "$($state.Bpm) BPM"
-    $metroTimer.Interval = Get-MetroInterval
-    if ($state.MetroRun) { $state.MetroSw.Restart() }   # новый темп = новая сетка от сейчас
+    if ($state.UseAudio) { Reset-AudioGrid }   # новый темп = новая сетка от конца ленты (уже записанное доиграется)
+    else { $metroTimer.Interval = Get-MetroInterval }
+    if ($state.MetroRun -and -not $state.UseAudio) { $state.MetroSw.Restart() }
 }
 foreach ($n in 'BtnBpmM10','BtnBpmM1','BtnBpmP1','BtnBpmP10') {
     (& $Find $n).Add_Click($clickBpm)
@@ -772,8 +961,9 @@ $btnDiv.Add_Click({
     # такт начинается заново (следующий щелчок = первая доля), интервал пересчитывается
     $state.Div = switch ($state.Div) { 1 { 2 } 2 { 4 } 4 { 3 } default { 1 } }
     $state.ClickCount = 0
-    $metroTimer.Interval = Get-MetroInterval
-    if ($state.MetroRun) { $state.MetroSw.Restart() }   # новая плотность щелчков = новая сетка от сейчас
+    if ($state.UseAudio) { Reset-AudioGrid }   # новая плотность щелчков = новая сетка от конца ленты
+    else { $metroTimer.Interval = Get-MetroInterval }
+    if ($state.MetroRun -and -not $state.UseAudio) { $state.MetroSw.Restart() }
     Update-DivBtn
 })
 
@@ -870,7 +1060,7 @@ $btnAbout.Add_Click({
     $sp = New-Object System.Windows.Controls.StackPanel
     $sp.Margin = New-Object System.Windows.Thickness(16)
     $tb1 = New-Object System.Windows.Controls.TextBlock
-    $tb1.Text = 'T-REX метроном v1.18'
+    $tb1.Text = 'T-REX метроном v1.19'
     $tb1.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI')
     $tb1.FontSize = 16; $tb1.FontWeight = [System.Windows.FontWeights]::Bold
     $tb1.Foreground = $bc.ConvertFromString('#FF7FB4FF')
@@ -913,6 +1103,9 @@ $win.Add_MouseWheel({
 })
 (& $Find 'BtnClose').Add_Click({ $win.Close() })
 $win.Add_Closed({
+    # остановить аудиодвижок до всего остального: живой поток WasapiOut удерживал бы процесс
+    # (в ps2exe-сборке — секунды после закрытого окна) от завершения
+    if ($audio) { try { Stop-AudioEngine } catch { } }
     try {
         # Left Top Opacity% Bpm Beats Accents TimerInitial Div; "сильных нет" пишется как "-"
         $acc = '-'
