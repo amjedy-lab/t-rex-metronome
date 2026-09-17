@@ -16,11 +16,13 @@ automatic JSONL training log.
 
 - **Metronome**: 30–300 BPM, time signatures 2–8, custom accented beats (click the
   dots under the tempo); the playing beat is highlighted.
-- **Sample-accurate clicks** (v1.19): if `NAudio.Core.dll` + `NAudio.Wasapi.dll` (MIT)
-  are placed next to the executable, clicks are scheduled into a continuous audio
+- **Sample-accurate clicks** (v1.19): clicks are scheduled into a continuous audio
   stream ahead of time and played by the sound device's own clock — measured jitter
-  is exactly 0 ms over a run (the timer-driven fallback of v1.18 stays available when
-  the DLLs are absent).
+  is exactly 0 ms over a run. The NAudio libraries (MIT) are embedded into the
+  executable as an appended payload and unpack to `%LOCALAPPDATA%\T-REX-Metronome`
+  on first launch; placing `NAudio.Core.dll` + `NAudio.Wasapi.dll` next to the exe
+  overrides the embedded copy. The timer-driven fallback of v1.18 stays available
+  when neither is present.
 - **Subdivisions**: quarter / eighth / sixteenth / triplet clicks. BPM always means
   the quarter-note tempo; inner clicks are quieter, accents stay on the beats.
 - **Practice timer** with alarm; **link mode**: when the timer hits zero, the current
@@ -38,10 +40,9 @@ automatic JSONL training log.
 
 Get `t_rex_metr.exe` from the [Releases](../../releases) page. The executable is
 unsigned — Windows SmartScreen will ask for confirmation ("More info → Run anyway").
-Sounds (`tm_*.wav`) are created automatically next to the exe on first launch. For the
-sample-accurate click engine, also put `NAudio.Core.dll` and `NAudio.Wasapi.dll`
-(NAudio 2.2.1, MIT) next to the exe; without them the metronome uses the built-in
-timer-driven playback.
+Sounds (`tm_*.wav`) are created automatically next to the exe on first launch. The
+sample-accurate click engine is built in: the NAudio libraries (2.2.1, MIT) are
+embedded into the exe and unpack to `%LOCALAPPDATA%\T-REX-Metronome` automatically.
 
 Or run from source:
 
@@ -87,7 +88,7 @@ MIT © Valentin Surovtsev
 - Прозрачность 20–100 %: колёсиком мыши над виджетом или панелью под шестерёнкой (справа вверху).
 - Таймер с кнопками −1м / −10с / +10с / +1м, «Старт/Пауза», «Сброс»; на нуле — тройной сигнал.
 - Метроном с кнопками −10 / −1 / +1 / +10, «Старт/Стоп», выбор размера такта 2–8 (кнопка «4/4»).
-- Точные щелчки (v1.19): если рядом с exe лежат `NAudio.Core.dll` и `NAudio.Wasapi.dll` (бесплатная библиотека NAudio, лицензия MIT), щелчки заранее планируются в непрерывный звуковой поток и звучат по часам аудиоустройства — дрожание исчезает полностью (замер: интервалы ровно 100,000 мс при номинале 100, накопленного дрейфа нет). Без этих файлов работает прежний способ (по таймеру, как в v1.18).
+- Точные щелчки (v1.19): щелчки заранее планируются в непрерывный звуковой поток и звучат по часам аудиоустройства — дрожание исчезает полностью (замер: интервалы ровно 100,000 мс при номинале 100, накопленного дрейфа нет). Библиотеки NAudio (MIT) ВСТРОЕНЫ в exe и распаковываются в `%LOCALAPPDATA%\T-REX-Metronome` при первом запуске; DLL рядом с exe имеют приоритет; если ничего нет — прежний способ по таймеру (v1.18).
 - Дробление доли (кнопка с нотой): четверти → восьмые → шестнадцатые → триоли. BPM задаёт темп четверти, дробление добавляет тихие щелчки внутрь доли; акценты звучат только на самих долях.
 - Сильные доли: точки под метрономом, клик переключает сильная/слабая (синяя точка с красным `>` = сильная, звучит выше). Текущая доля при звучании подсвечивается кольцом и увеличивается.
 - Режим «Связать»: одна кнопка Старт у таймера и метронома; при нуле таймера такт доигрывается до конца, затем всё останавливается и звучит сигнал.
@@ -116,7 +117,7 @@ MIT © Valentin Surovtsev
 - **v1.16** — дробление доли: четверти/восьмые/шестнадцатые/триоли (кнопка с нотой, параметр `-div`); BPM — по-прежнему темп четверти, промежуточные щелчки тише; дробление сохраняется в настройках и пишется в лог тренировки.
 - **v1.17** — поле дробления в логе тренировки переименовано в `Duration` — длительность ноты (`4`=четверть, `8`=восьмая, `16`=шестнадцатая, `3`=триоль; та же нотация, что у `-div`); раньше это поле называлось `Div`.
 - **v1.18** — ровный темп метронома: щелчки планируются по абсолютной сетке от старта (разовые задержки не накапливаются, темп не «уползает»), тикам поднят приоритет, системный таймер на время щелчков переводится в режим 1 мс, звуки предзагружаются. Замер: при 150 BPM средний интервал 399,8 мс при номинале 400 (было 405–410 с накоплением отставания).
-- **v1.19** — новый аудиодвижок щелчков (NAudio, опционально): клики заранее пишутся в непрерывную звуковую ленту и звучат по часам аудиоустройства — дрожание диспетчера Windows перестаёт быть слышным (замер на 150 BPM, шестнадцатые: все интервалы ровно 100,000 мс, дрейф 0; у v1.18 одиночные отклонения ±10–15 мс). Достаточно положить `NAudio.Core.dll` + `NAudio.Wasapi.dll` (MIT) рядом с exe; без них — прежний способ v1.18.
+- **v1.19** — новый аудиодвижок щелчков (NAudio, MIT): клики заранее пишутся в непрерывную звуковую ленту и звучат по часам аудиоустройства — дрожание диспетчера Windows перестаёт быть слышным (замер на 150 BPM, шестнадцатые: все интервалы ровно 100,000 мс, дрейф 0; у v1.18 одиночные отклонения ±10–15 мс). Библиотеки встроены в exe (appended-payload, распаковка в `%LOCALAPPDATA%\T-REX-Metronome`); DLL рядом с exe имеют приоритет, при их отсутствии и без payload — прежний способ v1.18.
 
 ## Параметры CLI
 
