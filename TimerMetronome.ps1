@@ -136,12 +136,61 @@ foreach ($p in @($playerTick, $playerTickHi, $playerTickSub, $playerAlarm)) { tr
 
 # --- движок точного щёлканья (v1.19, опциональный): клики заранее пишутся в непрерывную аудиоленту
 # (BufferedWaveProvider -> WasapiOut) с упреждением и звучат по часам аудиоустройства, а не по таймеру.
-# NAudio.Core.dll + NAudio.Wasapi.dll (MIT, netstandard2.0) лежат рядом со скриптом/exe;
-# нет библиотек / не открылось устройство — работаем прежним путём SoundPlayer (v1.18). ---
+# Библиотеки NAudio.Core.dll + NAudio.Wasapi.dll (MIT, netstandard2.0): сначала рядом со скриптом/exe,
+# а для exe — из ВСТРОЕННОГО appended-payload (gz(zip(DLL)) в хвосте exe, ASCII-футер
+# TREX-METR-PAYLOAD-V1:len=<N>; доклеивает build_exe.ps1), распаковка в %LOCALAPPDATA%\T-REX-Metronome.
+# Ничего не нашлось / не открылось устройство — работаем прежним путём SoundPlayer (v1.18). ---
 $audio = $null
 try {
     $dllCore = Join-Path $scriptDir 'NAudio.Core.dll'
     $dllWas  = Join-Path $scriptDir 'NAudio.Wasapi.dll'
+    if (-not ((Test-Path -LiteralPath $dllCore) -and (Test-Path -LiteralPath $dllWas)) -and $isExe) {
+        # exe без DLL рядом: извлечь встроенный payload из собственного файла
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $marker = 'TREX-METR-PAYLOAD-V1:len='
+        $fs = [IO.File]::OpenRead($selfPath)
+        try {
+            $tailLen = [int][Math]::Min(4096, $fs.Length)
+            $tail = New-Object 'byte[]' $tailLen
+            [void]$fs.Seek(-$tailLen, 'End')
+            [void]$fs.Read($tail, 0, $tailLen)
+            $txt = [Text.Encoding]::ASCII.GetString($tail)
+            $mi = $txt.LastIndexOf($marker)
+            if ($mi -ge 0) {
+                $nEnd = $txt.IndexOf("`n", $mi)
+                if ($nEnd -lt 0) { $nEnd = $txt.Length }
+                $len = [int]($txt.Substring($mi + $marker.Length, $nEnd - $mi - $marker.Length).Trim())
+                $footerStart = $fs.Length - $tailLen + $mi
+                if ($len -gt 0 -and ($footerStart - $len) -ge 0) {
+                    $gz = New-Object 'byte[]' $len
+                    [void]$fs.Seek($footerStart - $len, 'Begin')
+                    [void]$fs.Read($gz, 0, $len)
+                    $ms = [IO.MemoryStream]::new($gz)
+                    $gzIn = [IO.Compression.GZipStream]::new($ms, [IO.Compression.CompressionMode]::Decompress)
+                    $zipMs = [IO.MemoryStream]::new()
+                    $gzIn.CopyTo($zipMs)
+                    $gzIn.Dispose()
+                    $zipMs.Position = 0
+                    $zip = [IO.Compression.ZipArchive]::new($zipMs, [IO.Compression.ZipArchiveMode]::Read)
+                    try {
+                        # каталог-кэш по размеру payload: другой payload = другой каталог, перезатирания нет
+                        $dstDir = Join-Path $env:LOCALAPPDATA "T-REX-Metronome\payload\len$len"
+                        if (-not (Test-Path -LiteralPath (Join-Path $dstDir 'NAudio.Wasapi.dll'))) {
+                            [void][IO.Directory]::CreateDirectory($dstDir)
+                            foreach ($entry in $zip.Entries) {
+                                $es = $entry.Open()
+                                $ofs = [IO.File]::Create((Join-Path $dstDir $entry.FullName))
+                                $es.CopyTo($ofs)
+                                $ofs.Close(); $es.Close()
+                            }
+                        }
+                    } finally { $zip.Dispose() }
+                    $dllCore = Join-Path $dstDir 'NAudio.Core.dll'
+                    $dllWas  = Join-Path $dstDir 'NAudio.Wasapi.dll'
+                }
+            }
+        } finally { $fs.Close() }
+    }
     if ((Test-Path -LiteralPath $dllCore) -and (Test-Path -LiteralPath $dllWas)) {
         $null = [Reflection.Assembly]::LoadFrom($dllCore)
         $null = [Reflection.Assembly]::LoadFrom($dllWas)
