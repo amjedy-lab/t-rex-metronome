@@ -227,6 +227,10 @@ function Stop-AudioEngine {
 }
 function Write-AudioSilenceMs([double]$ms) {
     $n = [int]($ms * $audioBytesPerMs)
+    # только ЦЕЛЫЕ стерео-кадры (кратно 4 байтам): нечётный кусок сдвигает весь поток на полсэмпла,
+    # и следующий клик звучит шумом с клиппингом (призвук на дробных сетках, напр. триоли 150 BPM);
+    # потерянные 1-3 байта войдут в следующий кусок — позиция узлов уходит не более чем на 1 сэмпл
+    $n -= ($n % 4)
     while ($n -gt 0) {
         $c = [Math]::Min($n, $audioSilence.Length)
         $audio.Buf.AddSamples($audioSilence, 0, $c)
@@ -838,17 +842,20 @@ $metroTimer.Add_Tick({
         }
         if ($null -eq $state.FinaleAtMs) { Write-AudioUntilMs $horizonMs }
         elseif ($audio.Written -lt $state.FinaleAtMs) {
-            # финал запланирован: ленту нужно дописать тишиной ДО границы такта, иначе буфер
-            # высохнет, позиция «прочитано» замрёт раньше границы и финал никогда не наступит
-            Write-AudioUntilMs $state.FinaleAtMs
+            # финал запланирован: ленту нужно дописать тишиной ДО границы такта (+запас), иначе буфер
+            # высохнет, позиция «прочитано» замрёт раньше границы и финал никогда не наступит;
+            # запас +10 мс закрывает недобор из-за выравнивания кусков кратно 4 байтам (последние
+            # 1-3 байта иначе никогда не записываются и played не дотягивает до FinaleAtMs ровно на них)
+            Write-AudioUntilMs ($state.FinaleAtMs + 10)
         }
         # подсветка: применяем последний щелчок, чья позиция уже прозвучала (по часам ленты)
         $lastH = $null
         $rest = @()
         foreach ($h in $state.Highlights) { if ($h.Ms -le $playedMs) { $lastH = $h } else { $rest += $h } }
         if ($lastH) { $state.Highlights = $rest; Update-BeatHighlight $lastH.Beat $lastH.Sub }
-        # финиш доигранного такта — в момент границы такта по часам ленты (последний щелчок уже в буфере устройства)
-        if ($null -ne $state.FinaleAtMs -and $playedMs -ge $state.FinaleAtMs) {
+        # финиш доигранного такта — в момент границы такта по часам ленты (последний щелчок уже в буфере устройства);
+        # допуск 0.02 мс (~сэмпл) — округление байтов ленты не должно мешать достижению границы
+        if ($null -ne $state.FinaleAtMs -and $playedMs -ge ($state.FinaleAtMs - 0.02)) {
             $state.FinaleAtMs = $null
             $state.Overrun = $false
             $dispatchTimer.Stop()
